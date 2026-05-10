@@ -4,6 +4,8 @@
 
 The application was developed as part of a longitudinal research project studying how patients' vocal patterns evolve and converge toward the therapist's baseline across therapy sessions.
 
+A demo version of AcusTera — with transcription and Python-dependent modules disabled — is publicly available via ShinyLive on GitHub Pages at https://acabedo.github.io/Acustera/. A set of sample acoustic data is bundled with the demo; to load it, select the desired files and click Load selected.
+
 ---
 
 ## Research Context
