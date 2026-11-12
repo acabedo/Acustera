@@ -1,6 +1,10 @@
 # R/fn_textgrid.R — Minimal Praat TextGrid reader and writer.
 # IntervalTier only (no PointTier). Text format (not binary).
 
+# Label written on speech intervals that have no transcription, so that
+# they are not confused with the empty (silent) intervals Praat requires.
+SPEECH_MARK <- "<speech>"
+
 # ── Writer ─────────────────────────────────────────────────────────────
 # tiers: list(list(name = "man", intervals = tibble(xmin, xmax, text)), ...)
 # xmin/xmax in seconds. text can be "".
@@ -85,7 +89,8 @@ segs_to_textgrid <- function(segs, path, text_col = "text",
     list(name = h,
          intervals = data.frame(xmin = sub$start %||% sub$seg_start,
                                 xmax = sub$end   %||% sub$seg_end,
-                                text = ifelse(is.na(tx), "", tx),
+                                text = ifelse(is.na(tx) | !nzchar(trimws(tx)),
+                                              SPEECH_MARK, tx),
                                 stringsAsFactors = FALSE))
   })
   xmax <- duracion_total %||%
@@ -144,8 +149,10 @@ read_textgrid <- function(path) {
           l2 <- raw[i + k]
           if (grepl('xmin\\s*=', l2)) xmin <- as.numeric(sub('.*=\\s*', "", l2))
           else if (grepl('xmax\\s*=', l2)) xmax <- as.numeric(sub('.*=\\s*', "", l2))
-          else if (grepl('text\\s*=', l2))  text <- sub('.*text\\s*=\\s*"(.*)".*',
-                                                        "\\1", l2)
+          else if (grepl('text\\s*=', l2)) {
+            text <- sub('.*text\\s*=\\s*"(.*)".*', "\\1", l2)
+            break     # stop here: the next lines belong to the next interval
+          }
         }
         if (!is.na(xmin) && !is.na(xmax))
           rows[[length(rows)+1]] <- data.frame(
@@ -158,8 +165,10 @@ read_textgrid <- function(path) {
   if (length(rows) == 0) return(NULL)
   df <- do.call(rbind, rows)
   df <- df[!is.na(df$start) & !is.na(df$end) & df$end > df$start, , drop = FALSE]
-  # Discard empty intervals (silences)
-  df <- df[nzchar(trimws(df$text)) | !grepl("^\\s*$", df$speaker), , drop = FALSE]
+  # Discard empty intervals (silences): a speech interval must have a label.
+  # AcusTera writes "<speech>" for speech intervals without transcription.
+  df <- df[nzchar(trimws(df$text)), , drop = FALSE]
+  df$text[trimws(df$text) == SPEECH_MARK] <- ""
   df$duration <- df$end - df$start
   # Map tier → canonical speaker
   lc <- tolower(df$speaker)

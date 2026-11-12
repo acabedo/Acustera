@@ -1,0 +1,35 @@
+# Secrets — never commit
+hf_token.txt
+.acustera_keys.json
+*.token
+
+# Local working data produced by the app (may contain clinical audio, transcripts or results)
+transcriptions/
+textgrids/
+textgrids_full/
+review/
+reports/
+informes/
+.acustera_cache/
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.mov
+*.mp4
+
+# Engine scripts written at runtime by app.R
+engine_diarizen.py
+engine_crisper.py
+
+# Backups and system files
+*_backup*.R
+app copia.R
+__pycache__/
+.DS_Store
+.Rhistory
+.RData
+.Rproj.user/
+
+# Segment-level clinical data: available on request only
+evaluation/data/segments_acoustic.csv
