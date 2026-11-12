@@ -12,6 +12,8 @@ A demo version of AcusTera — with transcription and Python-dependent modules d
 
 The dataset included in this repository covers **four couples** (Malaga1, Malaga2, Zaragoza1, Zaragoza2) across **three therapy sessions** per couple (sessions 1, 9, and 20), yielding a longitudinal window into early, mid, and late therapeutic process.
 
+The folder [`evaluation/`](evaluation/) contains the materials of the tool evaluation on **complete sessions** (6 couples × 6 sessions, 44.2 h, CrisperWhisper + DiariZen): the role-attribution scripts, the scripts and aggregated results of the sampling-mode evaluation, and anonymised speaker-similarity data (couples coded C1–C6, no transcripts). Segment-level acoustic data are available on request.
+
 Two main hypotheses are operationalised in the app:
 
 - **H1 — Relative evolution**: Patients' prosodic parameters (pitch mean, pitch SD, pitch range, intensity) change significantly across therapy sessions relative to their own session-1 baseline.
@@ -134,6 +136,31 @@ Create a file named `.acustera_keys.json` in the project root (it is `.gitignore
 ```
 
 The HuggingFace token is required for speaker diarisation (pyannote.audio). Anthropic/OpenAI keys are only needed for the AI-assisted report generation and speaker attribution review features.
+
+### 7. (Optional) Alternative engines: DiariZen and CrisperWhisper
+
+In **03 · Process** you can choose the diarization engine (pyannote 3.1 or DiariZen) and the transcription engine (Whisper or CrisperWhisper 2.0).
+
+| Engine | Model | Strengths | Costs |
+|---|---|---|---|
+| pyannote 3.1 (default) | `pyannote/speaker-diarization-3.1` | In-process, light, runs on CPU/MPS; tunable thresholds and embedding model | Less accurate on long recordings with overlap and similar voices |
+| DiariZen | `BUT-FIT/diarizen-wavlm-large-s80-md-v2` | WavLM-large end-to-end model; fewer speaker confusions and better overlap handling | Heavy (GPU advised); separate environment (torch 2.8, Python 3.10) |
+| Whisper (default) | faster-whisper / mlx-whisper, `large-v3-turbo` | Fast, many languages, word probabilities | Fluent output: drops fillers, repetitions and false starts |
+| CrisperWhisper 2.0 | `nyralabs/CrisperWhisper2.0_large` | Verbatim: keeps fillers and disfluencies; more precise word timestamps (better segment boundaries and words/s) | Heavy (GPU advised); separate environment (Python 3.12); no word probabilities |
+
+DiariZen and CrisperWhisper run as subprocesses in their own virtual environments (`~/.venvs/diarizen-mps`, `~/.venvs/crisperwhisper`), which AcusTera installs with [uv](https://docs.astral.sh/uv/) on first use. To use existing environments, set `ACUSTERA_DIARIZEN_PY` / `ACUSTERA_CRISPER_PY` to their Python interpreter.
+
+**Local first.** By default every step of AcusTera runs on your own computer: no audio, transcript or result leaves it. This is the recommended setting for clinical recordings. DiariZen and CrisperWhisper also run locally, but on computers without an NVIDIA GPU (including Apple Silicon Macs, where they use the Apple GPU or the CPU) they are much slower than real time on long sessions; pyannote 3.1 + Whisper are the light alternative.
+
+**Precomputed results (optional, not local).** The heavy engines can run on a remote GPU with the notebook `colab/acustera_colab_gpu.ipynb`. Point *Precomputed results* to the folder with its output: for each audio `<stem>`, AcusTera loads `<stem>_diarizen.json` (or any `<stem>.rttm`) and `<stem>_crisperwhisper.json` instead of running the engines, and does role assignment, acoustic extraction and statistics locally.
+
+> **Privacy warning.** If you use Google Colab (or any cloud service), the audio recordings are uploaded to the provider's servers and the results contain the transcription of what was said. Your data are then **no longer only on your computer**. Use it only if the participants' consent, your ethics approval and your institution's data protection rules allow processing by that provider; give the files neutral names, do not save to Drive unless needed, and delete the runtime when you finish (the notebook includes a cleanup cell).
+
+### 8. Diarization review (local)
+
+The **Diarization review** tab measures how well the automatic diarization works on your own recordings. AcusTera cuts random excerpts (one per session quartile) and writes a WAV and a TextGrid with empty `man` / `woman` / `therapist` tiers (optionally a `words` tier from the transcription), without showing the automatic output. You annotate them in Praat and AcusTera computes, for every automatic output it finds (`<stem>_pyannote.rttm`, `<stem>_diarizen.json`, any `<stem>_<engine>.rttm`, and AcusTera's role TextGrids), the diarization error rate (DER, with optimal speaker mapping and a configurable collar) and the role attribution error. The implementation agrees with `pyannote.metrics` within 0.1 points. Everything stays on your computer.
+
+When a transcription is available, AcusTera also computes `tempo_wps` (words per second of the segment). `speech_rate` remains the voicing rate (voiced frames per second).
 
 ---
 

@@ -68,7 +68,7 @@ suppressPackageStartupMessages({
 })
 for (.f in c("R/fn_cache.R","R/fn_pos.R","R/fn_ai.R","R/fn_sessions.R",
              "R/fn_textgrid.R",
-             "R/fn_examples2.R","R/fn_report2.R",
+             "R/fn_examples2.R","R/fn_report2.R","R/fn_review.R",
              "R/ui_tabs_new.R","R/server_new.R")) {
   if (file.exists(.f)) source(.f, local = FALSE, encoding = "UTF-8")
 }
@@ -516,6 +516,391 @@ else:
   bind_rows(lapply(segs, as.data.frame)) |> mutate(duration = end - start)
 }
 
+# ══════════════════════════════════════════════════════════════
+# SECTION 2b — ALTERNATIVE ENGINES (DiariZen, CrisperWhisper) AND
+#              PRECOMPUTED RESULTS (JSON / RTTM, e.g. from Google Colab)
+# ══════════════════════════════════════════════════════════════
+# Engines available:
+#   diarization   : "pyannote" (pyannote 3.1, in-process via reticulate)
+#                   "diarizen" (BUT-FIT/diarizen-wavlm-large-s80-md-v2)
+#   transcription : "whisper"  (faster-whisper / mlx-whisper, in-process)
+#                   "crisper"  (nyralabs/CrisperWhisper2.0_large, verbatim)
+# DiariZen and CrisperWhisper need dependency sets that are incompatible with
+# each other and with pyannote 3.1 (DiariZen: torch 2.8 + its own pyannote
+# fork, Python 3.10; CrisperWhisper: Python 3.12 + transformers). They run in
+# their own virtual environments as subprocesses and exchange results through
+# JSON files in the same format as the Google Colab notebook
+# (colab/acustera_transcribir_diarizar.ipynb), so results computed on a
+# remote GPU can be loaded with the "precomputed results" folder instead.
+
+ENGINE_VENV <- c(diarizen = "~/.venvs/diarizen-mps", crisper = "~/.venvs/crisperwhisper")
+ENGINE_ENVVAR <- c(diarizen = "ACUSTERA_DIARIZEN_PY", crisper = "ACUSTERA_CRISPER_PY")
+DIARIZEN_COMMIT <- "844f5555b0a98acd0931511fc641a8c5b8ba92c7"
+
+.venv_python <- function(venv) {
+  venv <- path.expand(venv)
+  c(file.path(venv, "bin", "python"), file.path(venv, "Scripts", "python.exe"))
+}
+
+# Python interpreter of an engine: env var > option > default venv(s)
+.engine_python <- function(engine) {
+  cand <- c(Sys.getenv(ENGINE_ENVVAR[[engine]]),
+            getOption(paste0("acustera.", engine, "_py"), ""),
+            .venv_python(ENGINE_VENV[[engine]]),
+            if (engine == "diarizen") .venv_python("~/.venvs/diarizen"))
+  cand <- path.expand(cand[nzchar(cand)])
+  hit  <- cand[file.exists(cand)]
+  if (length(hit)) hit[1] else NULL
+}
+
+.run_cmd <- function(cmd, args, log = message) {
+  out <- suppressWarnings(system2(cmd, args, stdout = TRUE, stderr = TRUE))
+  st  <- attr(out, "status") %||% 0L
+  if (!identical(as.integer(st), 0L))
+    stop(sprintf("'%s %s' failed (status %s): %s", basename(cmd),
+                 paste(head(args, 2), collapse = " "), st,
+                 paste(tail(out, 8), collapse = " | ")))
+  invisible(out)
+}
+
+# Installs an engine in its own virtual environment with uv
+# (https://docs.astral.sh/uv/). Same package versions as the Colab notebook.
+install_engine <- function(engine, log = message) {
+  uv <- Sys.which("uv")
+  if (!nzchar(uv)) uv <- path.expand("~/.local/bin/uv")
+  if (!file.exists(uv))
+    stop("Installing ", engine, " requires 'uv' (https://docs.astral.sh/uv/). ",
+         "Install uv, or set ", ENGINE_ENVVAR[[engine]],
+         " to the Python of an environment where the engine is installed.")
+  venv <- path.expand(ENGINE_VENV[[engine]])
+  is_mac <- Sys.info()[["sysname"]] == "Darwin"
+  if (engine == "crisper") {
+    log("Installing CrisperWhisper 2.0.3 in ", venv, " (several minutes)...")
+    .run_cmd(uv, c("venv", "-q", shQuote(venv), "--python", "3.12"), log)
+    py <- .venv_python(venv)[file.exists(.venv_python(venv))][1]
+    pkg <- if (is_mac) "crisperwhisper==2.0.3" else "crisperwhisper[ct2,convert]==2.0.3"
+    .run_cmd(uv, c("pip", "install", "-q", "--python", shQuote(py),
+                   shQuote(pkg), shQuote("transformers>=4.46,<5")), log)
+  } else {
+    src <- path.expand("~/.venvs/diarizen-src")
+    log("Installing DiariZen (commit ", substr(DIARIZEN_COMMIT, 1, 8), ") in ", venv,
+        " (10-20 min)...")
+    if (!dir.exists(src))
+      .run_cmd("git", c("clone", "-q", "--recurse-submodules",
+                        "https://github.com/BUTSpeechFIT/DiariZen", shQuote(src)), log)
+    .run_cmd("git", c("-C", shQuote(src), "checkout", "-q", DIARIZEN_COMMIT), log)
+    .run_cmd("git", c("-C", shQuote(src), "submodule", "update", "-q", "--init", "--recursive"), log)
+    .run_cmd(uv, c("venv", "-q", shQuote(venv), "--python", "3.10"), log)
+    py  <- .venv_python(venv)[file.exists(.venv_python(venv))][1]
+    req <- readLines(file.path(src, "requirements.txt"))
+    req_tmp <- tempfile(fileext = ".txt")
+    writeLines(req[!grepl("onnxruntime|jupyterlab|pre-commit", req)], req_tmp)
+    .run_cmd(uv, c("pip", "install", "-q", "--python", shQuote(py),
+                   "torch==2.8.0", "torchaudio==2.8.0", "numpy==1.26.4",
+                   "-r", shQuote(req_tmp),
+                   "-r", shQuote(file.path(src, "pyannote-audio", "requirements.txt"))), log)
+    .run_cmd(uv, c("pip", "install", "-q", "--python", shQuote(py),
+                   "-e", shQuote(file.path(src, "pyannote-audio")), "-e", shQuote(src)), log)
+  }
+  log("✓ ", engine, " installed.")
+}
+
+ensure_engine <- function(engine, log = message) {
+  py <- .engine_python(engine)
+  if (is.null(py)) { install_engine(engine, log); py <- .engine_python(engine) }
+  if (is.null(py)) stop("Python environment for ", engine, " not found.")
+  log(sprintf("  ✓ %s environment: %s", engine, py))
+  py
+}
+
+DIARIZEN_SCRIPT <- r"(
+# AcusTera engine script: DiariZen diarization (same format as the Colab notebook)
+# usage: python engine_diarizen.py AUDIO START_S END_S OUT.json N_SPEAKERS
+import json, os, subprocess, sys, tempfile, time
+import torch
+from diarizen.pipelines.inference import DiariZenPipeline
+MODEL = 'BUT-FIT/diarizen-wavlm-large-s80-md-v2'
+
+def main(audio, ini, fin, out, n='3'):
+    ini, fin, n = float(ini), float(fin), int(n)
+    with tempfile.TemporaryDirectory() as tmp:
+        wav = os.path.join(tmp, 'chunk.wav')
+        subprocess.run(['ffmpeg', '-nostdin', '-loglevel', 'error', '-ss', str(ini), '-to', str(fin),
+                        '-i', audio, '-ac', '1', '-ar', '16000', wav], check=True)
+        p = DiariZenPipeline.from_pretrained(MODEL)
+        p.min_speakers = p.max_speakers = n
+        modern = tuple(int(x) for x in torch.__version__.split('.')[:2]) >= (2, 4)
+        dev = os.environ.get('DIARIZAR_DISPOSITIVO') or (
+            'cuda' if torch.cuda.is_available() else
+            'mps' if torch.backends.mps.is_available() and modern else 'cpu')
+        p.to(torch.device(dev))
+        t1 = time.time(); r = p(wav); dur = time.time() - t1
+    turns = [{'hablante': f'SPK_{spk}', 'ini': round(t.start + ini, 3), 'fin': round(t.end + ini, 3)}
+             for t, _, spk in r.itertracks(yield_label=True)]
+    json.dump({'audio': os.path.basename(audio), 'modelo': MODEL, 'n_hablantes': n, 'dispositivo': dev,
+               'inicio_s': ini, 'fin_s': fin, 'segundos_proceso': round(dur), 'turnos': turns},
+              open(out, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
+    print(f'{len(turns)} turns; {fin - ini:.0f} s of audio in {dur:.0f} s ({dev})')
+
+if __name__ == '__main__':
+    main(*sys.argv[1:])
+)"
+
+CRISPER_SCRIPT <- r"(
+# AcusTera engine script: CrisperWhisper 2.0 verbatim transcription (same format as the Colab notebook)
+# usage: python engine_crisper.py AUDIO START_S END_S OUT.json LANGUAGE
+import json, os, subprocess, sys, time
+import numpy as np
+MODEL = 'nyralabs/CrisperWhisper2.0_large'
+RETRIES = [{}, {'max_new_tokens': 192, 'context_words': 6}, {'max_new_tokens': 128, 'context_words': 0}]
+
+def read_chunk(audio, ini, fin, sr=16000):
+    raw = subprocess.run(['ffmpeg', '-nostdin', '-loglevel', 'error', '-ss', str(ini), '-to', str(fin), '-i', audio,
+                          '-ac', '1', '-ar', str(sr), '-f', 'f32le', '-'], capture_output=True, check=True).stdout
+    return np.frombuffer(raw, dtype=np.float32)
+
+def main(audio, ini, fin, out, language='es'):
+    import torch
+    from crisperwhisper import CrisperWhisperModel
+    ini, fin = float(ini), float(fin)
+    if torch.cuda.is_available():
+        dev = 'cuda'; m = CrisperWhisperModel(MODEL, backend='ct2', device='cuda', compute_type='float16')
+    else:
+        dev = 'mps' if torch.backends.mps.is_available() else 'cpu'
+        m = CrisperWhisperModel(MODEL, backend='transformers', device=dev)
+    wav = read_chunk(audio, ini, fin)
+    kw = dict(sr=16000, mode='verbatim', word_timestamps=True)
+    if language and language != 'auto': kw['language'] = language
+    t1 = time.time()
+    for k, extra in enumerate(RETRIES):
+        try:
+            r = m.transcribe(wav, **kw, **extra); break
+        except RuntimeError as e:
+            if 'position' not in str(e) or k == len(RETRIES) - 1: raise
+    dur = time.time() - t1
+    words = [{'palabra': w.word, 'ini': round(w.start + ini, 3), 'fin': round(w.end + ini, 3)} for w in r.words]
+    json.dump({'audio': os.path.basename(audio), 'modelo': MODEL, 'modo': 'verbatim', 'inicio_s': ini,
+               'fin_s': fin, 'segundos_proceso': round(dur), 'parametros': extra, 'texto': r.text,
+               'palabras': words}, open(out, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
+    print(f'{len(words)} words; {fin - ini:.0f} s of audio in {dur:.0f} s ({dev})')
+
+if __name__ == '__main__':
+    main(*sys.argv[1:])
+)"
+
+.engine_script <- function(engine) {
+  path <- file.path(getwd(), paste0("engine_", engine, ".py"))
+  writeLines(if (engine == "diarizen") DIARIZEN_SCRIPT else CRISPER_SCRIPT, path)
+  path
+}
+
+# Runs an engine script on [ini, fin] of the audio and returns the JSON path
+.run_engine <- function(engine, path, ini, fin, extra_arg, log = message) {
+  py  <- ensure_engine(engine, log)
+  out <- tempfile(fileext = ".json")
+  old <- Sys.getenv(c("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "PYTORCH_ENABLE_MPS_FALLBACK"),
+                    unset = NA)
+  Sys.setenv(TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD = "1", PYTORCH_ENABLE_MPS_FALLBACK = "1")
+  on.exit({
+    for (k in names(old))
+      if (is.na(old[[k]])) Sys.unsetenv(k) else do.call(Sys.setenv, setNames(list(old[[k]]), k))
+  }, add = TRUE)
+  log(sprintf("  Running %s on %.0f–%.0f s (subprocess)...", engine, ini, fin))
+  res <- .run_cmd(py, c(shQuote(.engine_script(engine)), shQuote(path),
+                        sprintf("%.3f", ini), sprintf("%.3f", fin),
+                        shQuote(out), shQuote(extra_arg)), log)
+  log("  ✓ ", tail(res, 1))
+  out
+}
+
+# ── Readers of external / precomputed results ──────────────────
+read_diar_file <- function(f) {
+  if (grepl("\\.rttm$", f, ignore.case = TRUE)) {
+    x <- utils::read.table(f, header = FALSE, stringsAsFactors = FALSE,
+                           comment.char = ";", fill = TRUE)
+    x <- x[x$V1 == "SPEAKER", , drop = FALSE]
+    return(tibble(start = as.numeric(x$V4), end = as.numeric(x$V4) + as.numeric(x$V5),
+                  speaker = as.character(x$V8)))
+  }
+  j <- jsonlite::fromJSON(f)
+  t <- j$turnos %||% j$turns %||% j$segments
+  tibble(start   = as.numeric(t$ini %||% t$start),
+         end     = as.numeric(t$fin %||% t$end),
+         speaker = as.character(t$hablante %||% t$speaker))
+}
+
+# Words from a CrisperWhisper JSON (palabras/ini/fin) or a Whisper JSON
+# (segments[].words[]). Words get a leading space, as in Whisper, so that
+# paste0(collapse = "") rebuilds the text.
+read_words_file <- function(f) {
+  txt <- gsub("\\bNaN\\b", "null", paste(readLines(f, warn = FALSE), collapse = "\n"))
+  j <- jsonlite::fromJSON(txt, simplifyVector = FALSE)
+  if (!is.null(j$palabras)) {
+    w <- j$palabras
+    return(list(words = tibble(
+      word        = paste0(" ", trimws(vapply(w, \(x) as.character(x$palabra %||% ""), ""))),
+      w_start     = vapply(w, \(x) as.numeric(x$ini %||% NA), 0),
+      w_end       = vapply(w, \(x) as.numeric(x$fin %||% NA), 0),
+      probability = NA_real_), segments = tibble()))
+  }
+  words <- list(); segs <- list()
+  for (s in j$segments %||% list()) {
+    segs[[length(segs) + 1]] <- tibble(w_start = as.numeric(s$start %||% NA),
+                                       w_end = as.numeric(s$end %||% NA),
+                                       text = as.character(s$text %||% ""))
+    for (w in s$words %||% list())
+      words[[length(words) + 1]] <- tibble(word = as.character(w$word %||% ""),
+                                           w_start = as.numeric(w$start %||% NA),
+                                           w_end = as.numeric(w$end %||% NA),
+                                           probability = as.numeric(w$probability %||% NA))
+  }
+  list(words = bind_rows(words), segments = bind_rows(segs))
+}
+
+write_rttm <- function(segs, path, file_id = "audio") {
+  writeLines(sprintf("SPEAKER %s 1 %.3f %.3f <NA> <NA> %s <NA> <NA>", file_id,
+                     segs$start, segs$end - segs$start, segs$speaker), path)
+}
+
+# Pseudo-segments for the transcript table when the engine returns only words
+words_to_segments <- function(words, gap = 1.0) {
+  if (nrow(words) == 0) return(tibble())
+  words <- words[order(words$w_start), , drop = FALSE]
+  g <- cumsum(c(TRUE, words$w_start[-1] - words$w_end[-nrow(words)] >= gap))
+  words |> mutate(.g = g) |> group_by(.g) |>
+    summarise(w_start = min(w_start), w_end = max(w_end),
+              text = trimws(paste0(word, collapse = "")), .groups = "drop") |>
+    select(-.g)
+}
+
+# Looks for <stem>_diarizen.json / .rttm (diar) or <stem>_crisperwhisper.json /
+# <stem>.json (asr) in the precomputed folder (case-insensitive).
+find_precomputed <- function(dir, stem, kind = c("diar", "asr")) {
+  kind <- match.arg(kind)
+  if (is.null(dir) || !nzchar(dir)) return(NULL)
+  dir <- path.expand(dir)
+  if (!dir.exists(dir)) return(NULL)
+  suf <- if (kind == "diar") c("_diarizen.json", "_diarizen.rttm", "_pyannote.rttm", ".rttm")
+         else c("_crisperwhisper.json", "_whisper.json", ".json")
+  fl  <- list.files(dir)
+  for (s in suf) {
+    hit <- fl[tolower(fl) == tolower(paste0(stem, s))]
+    if (length(hit)) return(file.path(dir, hit[1]))
+  }
+  NULL
+}
+
+# Keeps the n_speakers labels with most speech; DiariZen sometimes adds a
+# spurious label with a few tiny turns.
+drop_minor_speakers <- function(segs, n_speakers, log = message) {
+  if (nrow(segs) == 0) return(segs)
+  tot <- segs |> group_by(speaker) |> summarise(t = sum(end - start), .groups = "drop") |>
+    arrange(desc(t))
+  if (nrow(tot) <= n_speakers) return(segs)
+  drop <- tot$speaker[-seq_len(n_speakers)]
+  log(sprintf("  Discarding %d minor speaker label(s) (%.1f s): %s", length(drop),
+              sum(tot$t[tot$speaker %in% drop]), paste(drop, collapse = ", ")))
+  filter(segs, !speaker %in% drop)
+}
+
+# Unified diarization. Returns segments in ABSOLUTE time of the original audio,
+# restricted to [offset, offset + len] when len is given (sample mode).
+diarize_any <- function(path, n_speakers = 3L, engine = "pyannote",
+                        offset = 0, len = NULL, total_dur = NULL,
+                        precomputed = NULL, stem = NULL,
+                        clustering_threshold = 0.7, segmentation_threshold = 0.5,
+                        log = message) {
+  end_t <- if (is.null(len)) (total_dur %||% 1e6) else offset + len
+  if (!is.null(precomputed)) {
+    log(sprintf("  Diarization loaded from %s", basename(precomputed)))
+    segs <- read_diar_file(precomputed) |>
+      filter(end > offset, start < end_t) |>
+      mutate(start = pmax(start, offset), end = pmin(end, end_t))
+  } else if (engine == "diarizen") {
+    f <- .run_engine("diarizen", path, offset, end_t, as.character(n_speakers), log)
+    if (is.null(len) && !is.null(stem)) {
+      dd <- file.path(getwd(), "transcriptions")
+      if (!dir.exists(dd)) dir.create(dd, recursive = TRUE)
+      file.copy(f, file.path(dd, paste0(stem, "_diarizen.json")), overwrite = TRUE)
+    }
+    segs <- read_diar_file(f); unlink(f)
+  } else if (is.null(len)) {
+    segs <- diarize(path, n_speakers, clustering_threshold = clustering_threshold,
+                    segmentation_threshold = segmentation_threshold, log = log)
+    if (nrow(segs) > 0 && !is.null(stem)) {         # kept for the diarization review
+      dd <- file.path(getwd(), "transcriptions")
+      if (!dir.exists(dd)) dir.create(dd, recursive = TRUE)
+      write_rttm(segs, file.path(dd, paste0(stem, "_pyannote.rttm")), stem)
+    }
+  } else {
+    chunk_f <- tempfile(fileext = ".wav")
+    on.exit(unlink(chunk_f), add = TRUE)
+    system2("ffmpeg", c("-y", "-ss", sprintf("%.3f", offset), "-t", sprintf("%.3f", len),
+                        "-i", shQuote(path), "-ac", "1", "-ar", "16000",
+                        "-loglevel", "error", shQuote(chunk_f)), stdout = FALSE, stderr = FALSE)
+    if (!file.exists(chunk_f) || file.size(chunk_f) < 1000) {
+      log(sprintf("  Warning: chunk at %.0f s could not be extracted", offset))
+      return(tibble())
+    }
+    segs <- diarize(chunk_f, n_speakers, clustering_threshold = clustering_threshold,
+                    segmentation_threshold = segmentation_threshold, log = log)
+    if (nrow(segs) > 0) segs <- mutate(segs, start = start + offset, end = end + offset)
+  }
+  if (nrow(segs) == 0) return(tibble())
+  segs |> select(start, end, speaker) |>
+    mutate(start = round(start, 3), end = round(end, 3), duration = end - start) |>
+    filter(duration > 0) |> arrange(start) |>
+    drop_minor_speakers(n_speakers, log)
+}
+
+# Unified transcription. Returns list(words, segments) in ABSOLUTE time.
+transcribe_any <- function(path, engine = "whisper", offset = 0, len = NULL,
+                           total_dur = NULL, precomputed = NULL,
+                           language = "es", orig_name = NULL, log = message) {
+  end_t <- if (is.null(len)) (total_dur %||% 1e6) else offset + len
+  clip  <- function(res) {
+    w <- res$words; s <- res$segments
+    if (nrow(w) > 0) w <- filter(w, w_start >= offset, w_end <= end_t)
+    if (nrow(s) > 0) s <- filter(s, w_start >= offset, w_end <= end_t)
+    if (nrow(s) == 0) s <- words_to_segments(w)
+    list(words = w, segments = s)
+  }
+  if (!is.null(precomputed)) {
+    log(sprintf("  Transcription loaded from %s", basename(precomputed)))
+    return(clip(read_words_file(precomputed)))
+  }
+  if (engine == "crisper") {
+    f <- .run_engine("crisper", path, offset, end_t, language %||% "auto", log)
+    if (is.null(len) && !is.null(orig_name)) {
+      dd <- file.path(getwd(), "transcriptions")
+      if (!dir.exists(dd)) dir.create(dd, recursive = TRUE)
+      file.copy(f, file.path(dd, paste0(orig_name, "_crisperwhisper.json")), overwrite = TRUE)
+    }
+    res <- read_words_file(f); unlink(f)
+    return(clip(res))
+  }
+  # Whisper (faster-whisper / mlx-whisper)
+  if (is.null(len)) {
+    r <- transcribe_verbatim(path, language = language, orig_name = orig_name, log = log)
+  } else {
+    chunk_f <- tempfile(fileext = ".wav")
+    on.exit(unlink(chunk_f), add = TRUE)
+    system2("ffmpeg", c("-y", "-ss", sprintf("%.3f", offset), "-t", sprintf("%.3f", len),
+                        "-i", shQuote(path), "-ac", "1", "-ar", "16000",
+                        "-loglevel", "error", shQuote(chunk_f)), stdout = FALSE, stderr = FALSE)
+    if (!file.exists(chunk_f) || file.size(chunk_f) < 1000)
+      return(list(words = tibble(), segments = tibble()))
+    r <- transcribe_verbatim(chunk_f, language = language, log = log)
+    shift <- function(d) if (nrow(d) > 0) mutate(d, w_start = w_start + offset,
+                                                 w_end = w_end + offset) else d
+    r <- list(words = shift(if (is.list(r)) r$words else r),
+              segments = shift(if (is.list(r)) r$segments else tibble()))
+  }
+  if (!is.list(r) || is.data.frame(r)) r <- list(words = r, segments = tibble())
+  if (nrow(r$segments %||% tibble()) == 0) r$segments <- words_to_segments(r$words)
+  r
+}
+
 detect_overlaps <- function(segs, log = message) {
   log("  Detecting overlaps...")
   if (nrow(segs) < 2) return(tibble(ov_start=double(), ov_end=double(), ov_dur=double()))
@@ -602,6 +987,17 @@ assign_roles <- function(path, segs, ref_emb = NULL, log = message) {
 # SECTION 4 — PIPELINE PER SESSION
 # ══════════════════════════════════════════════════════════════
 
+# Word-based tempo (words per second of the segment), available whenever the
+# segment has a transcription (Whisper, CrisperWhisper or TextGrid text).
+# It complements speech_rate, which counts voiced frames per second.
+add_word_tempo <- function(features) {
+  if (nrow(features) == 0 || !"n_words" %in% names(features)) return(features)
+  nw <- suppressWarnings(as.numeric(features$n_words))
+  ok <- !is.na(features$text %||% NA) & !is.na(nw) & nw > 0 & features$duration > 0
+  features$tempo_wps <- ifelse(ok, nw / features$duration, NA_real_)
+  features
+}
+
 process_session <- function(path, couple, therapy, therapy_num,
                              n_speakers, ref_emb,
                              min_seg, n_mfcc, do_overlap, do_quantiles,
@@ -613,7 +1009,13 @@ process_session <- function(path, couple, therapy, therapy_num,
                              clustering_threshold   = 0.7,
                              segmentation_threshold = 0.5,
                              textgrid_path = NULL,
+                             diar_engine = "pyannote",
+                             asr_engine  = "whisper",
+                             precomputed_dir = NULL,
                              log = message) {
+  file_stem0 <- tools::file_path_sans_ext(orig_name %||% basename(path))
+  pre_diar <- find_precomputed(precomputed_dir, file_stem0, "diar")
+  pre_asr  <- if (do_transcribe) find_precomputed(precomputed_dir, file_stem0, "asr") else NULL
   # ── Total audio duration ─────────────────────────────
   total_dur <- tryCatch({
     h <- readWave(path, header=TRUE)
@@ -711,6 +1113,8 @@ process_session <- function(path, couple, therapy, therapy_num,
       dur_woman_s  = round(sum(segs$duration[segs$speaker=="woman"]),1),
       dur_terap_s  = round(sum(segs$duration[segs$speaker=="therapist"]),1))
 
+    features <- add_word_tempo(features)
+
     # Save CSVs and TextGrid (for traceability; we re-export the one we used)
     out_dir <- file.path(getwd(), "transcriptions")
     if (!dir.exists(out_dir)) dir.create(out_dir, recursive=TRUE)
@@ -735,62 +1139,51 @@ process_session <- function(path, couple, therapy, therapy_num,
     log(sprintf("  Sample mode: first %.0f min per quantile (%.0f min total).",
                 sample_mins, sample_mins * 4))
 
-    tmp_chunks <- character(4)
     segs_all   <- list()
 
     for (q in 1:4) {
       q_start <- quantile_bounds[q]
-      chunk_f  <- tempfile(fileext=".wav")
-      tmp_chunks[q] <- chunk_f
-
-      # Extract chunk with ffmpeg
-      ret <- system2("ffmpeg", c(
-        "-y", "-ss", sprintf("%.3f", q_start),
-        "-t",  sprintf("%.3f", sample_secs),
-        "-i",  path,
-        "-ac", "1", "-ar", "16000",
-        "-loglevel", "error",
-        chunk_f), stdout=FALSE, stderr=FALSE)
-
-      if (!file.exists(chunk_f) || file.size(chunk_f) < 1000) {
-        log(sprintf("  Warning: chunk could not be extracted Q%d", q))
-        next
-      }
-
-      # To diary chunk
+      # diarize_any returns absolute times of the original audio
       chunk_segs <- tryCatch(
-        diarize(chunk_f, n_speakers,
-                clustering_threshold   = clustering_threshold,
-                segmentation_threshold = segmentation_threshold,
-                log = log),
-        error = \(e) tibble()
+        diarize_any(path, n_speakers, diar_engine,
+                    offset = q_start, len = sample_secs, total_dur = total_dur,
+                    precomputed = pre_diar,
+                    clustering_threshold   = clustering_threshold,
+                    segmentation_threshold = segmentation_threshold,
+                    log = log),
+        error = \(e) { log(sprintf("  Diarization error Q%d: %s", q, conditionMessage(e))); tibble() }
       )
 
       if (nrow(chunk_segs) > 0) {
-        # Shift timestamps to the actual value in the original audio
-        chunk_segs <- chunk_segs |>
-          mutate(start = round(start + q_start, 3),
-                 end   = round(end   + q_start, 3))
-        segs_all[[q]] <- chunk_segs
+        # Speaker labels are LOCAL to each chunk (pyannote and DiariZen re-number
+        # them per file), so they are prefixed with the quartile to avoid treating
+        # SPEAKER_00 of Q1 and SPEAKER_00 of Q2 as the same person.
+        segs_all[[q]] <- chunk_segs |> mutate(speaker = paste0("Q", q, "_", speaker))
       }
     }
-
-    # clean temporary files
-    for (f in tmp_chunks) if (file.exists(f)) unlink(f)
 
     segs <- bind_rows(compact(segs_all))
     if (nrow(segs) == 0) { log("  No segments in sample mode."); return(NULL) }
 
   } else {
-    # Full mode: diar the entire audio
-    segs <- diarize(path, n_speakers,
-                  clustering_threshold   = clustering_threshold,
-                  segmentation_threshold = segmentation_threshold,
-                  log = log)
+    # Full mode: diarize the entire audio
+    segs <- diarize_any(path, n_speakers, diar_engine, total_dur = total_dur,
+                        precomputed = pre_diar, stem = file_stem0,
+                        clustering_threshold   = clustering_threshold,
+                        segmentation_threshold = segmentation_threshold,
+                        log = log)
     if (nrow(segs) == 0) { log("  No segments."); return(NULL) }
   }
 
-  roles <- assign_roles(path, segs, ref_emb, log)
+  roles <- if (sample_secs > 0) {
+    # Sample mode: each quartile was diarised separately, so roles are
+    # assigned within each quartile (labels are "Qn_SPEAKER_xx").
+    q_of <- sub("_.*$", "", segs$speaker)
+    unlist(unname(lapply(split(segs, q_of), function(sq) {
+      log(sprintf("    Roles for %s", sub("_.*$", "", sq$speaker[1])))
+      assign_roles(path, sq, ref_emb, log)
+    })))
+  } else assign_roles(path, segs, ref_emb, log)
   segs  <- segs |> mutate(speaker_id = speaker,
                            speaker    = roles[speaker] %||% "unknown")
 
@@ -814,31 +1207,24 @@ process_session <- function(path, couple, therapy, therapy_num,
     if (sample_secs > 0) {
       log("  Transcribing sample chunks (pre-acoustic)...")
       for (q in 1:4) {
-        q_start  <- quantile_bounds[q]
-        chunk_f  <- tempfile(fileext=".wav")
-        system2("ffmpeg", c(
-          "-y","-ss", sprintf("%.3f", q_start),
-          "-t",  sprintf("%.3f", sample_secs),
-          "-i",  path, "-ac","1","-ar","16000",
-          "-loglevel","error", chunk_f),
-          stdout=FALSE, stderr=FALSE)
-        if (!file.exists(chunk_f) || file.size(chunk_f) < 1000) next
-        res_q <- transcribe_verbatim(chunk_f, language=language, log=log)
-        unlink(chunk_f)
-        w_q <- if (is.list(res_q)) res_q$words    else res_q
-        s_q <- if (is.list(res_q)) res_q$segments else tibble()
-        if (nrow(w_q) > 0)
-          w_q <- w_q |> mutate(w_start=w_start+q_start, w_end=w_end+q_start)
-        if (nrow(s_q) > 0)
-          s_q <- s_q |> mutate(w_start=w_start+q_start, w_end=w_end+q_start)
-        all_words <- bind_rows(all_words, w_q)
-        all_wsegs <- bind_rows(all_wsegs, s_q)
+        res_q <- tryCatch(
+          transcribe_any(path, asr_engine, offset = quantile_bounds[q],
+                         len = sample_secs, total_dur = total_dur,
+                         precomputed = pre_asr, language = language, log = log),
+          error = \(e) { log(sprintf("  Transcription error Q%d: %s", q, conditionMessage(e)))
+                         list(words = tibble(), segments = tibble()) })
+        all_words <- bind_rows(all_words, res_q$words)
+        all_wsegs <- bind_rows(all_wsegs, res_q$segments)
       }
     } else {
-      result    <- transcribe_verbatim(path, language=language,
-                                       orig_name=orig_name, log=log)
-      all_words <- if (is.list(result)) result$words    else result
-      all_wsegs <- if (is.list(result)) result$segments else tibble()
+      result <- tryCatch(
+        transcribe_any(path, asr_engine, total_dur = total_dur,
+                       precomputed = pre_asr, language = language,
+                       orig_name = file_stem0, log = log),
+        error = \(e) { log(paste("  Transcription error:", conditionMessage(e)))
+                       list(words = tibble(), segments = tibble()) })
+      all_words <- result$words
+      all_wsegs <- result$segments
     }
 
     if (nrow(all_words) > 0) {
@@ -850,7 +1236,7 @@ process_session <- function(path, couple, therapy, therapy_num,
         "  ✓ Segments reconstructed from the transcript (pause ≥%.2fs): %d → %d.",
         pause_thr, n_before, nrow(segs)))
     } else {
-      log("  Note: Whisper did not return any words; I used Pyannote borders.")
+      log("  Note: the transcription returned no words; diarization boundaries are used.")
     }
   }
 
@@ -968,6 +1354,8 @@ process_session <- function(path, couple, therapy, therapy_num,
     features <- features |> mutate(text=NA_character_, n_words=NA_integer_,
                                     avg_logprob=NA_real_)
   }
+
+  features <- add_word_tempo(features)
 
   # Save CSV of acoustic features
   out_dir <- file.path(getwd(), "transcriptions")
@@ -1401,7 +1789,7 @@ intensity_mean="Intensity (dB)",
 intensity_sd="SD intensity", hnr="HNR (dB)", 
 jitter_local="Jitter local", shimmer_local="Shimmer local", 
 cpp="CPP (dB)", 
-speech_rate="Speech rate", zcr="ZCR", 
+speech_rate="Voicing rate (voiced frames/s)", tempo_wps="Tempo (words/s)", zcr="ZCR",
 rms="RMS", spectral_centroid="Special centroid (Hz)", 
 mfcc1="MFCC-1", mfcc2="MFCC-2", mfcc3="MFCC-3"
 )
@@ -2580,6 +2968,8 @@ shinydashboard::menuSubItem("Prosodic profile", tabName="tab_profile"),
 shinydashboard::menuSubItem("Linguistics (POS)", tabName="tab_ling"), 
 shinydashboard::menuSubItem("IA speakers review", tabName="tab_ai_rev") 
 ), 
+shinydashboard::menuItem("Diarization review", tabName="tab_review",
+icon=shiny::icon("user-check")),
 shinydashboard::menuItem("Methods", tabName="tab_methods", 
 icon=shiny::icon("book")), 
 shinydashboard::menuItem("05 · Report", tabName="tab_report", 
@@ -2923,6 +3313,12 @@ hint_txt("WavLM offers better separation of similar speakers. ",
 ),
 shinydashboard::box(
 title="Diarization", width=3, status="primary",
+selectInput("diar_engine", "Diarization engine",
+  choices = c("pyannote 3.1 (in-process, light)" = "pyannote",
+              "DiariZen WavLM-large (more accurate, GPU advised)" = "diarizen"),
+  selected = "pyannote"),
+hint_txt("DiariZen runs in its own environment (~/.venvs/diarizen-mps); ",
+         "it is installed on first use. The thresholds and embedding model below apply to pyannote only."),
 numericInput("n_speakers","Number of speakers",3,2,8),
 numericInput("min_seg","Minimum sec (s)",2,.5,10,.5),
 checkboxInput("do_overlap","Detect overlappings",TRUE),
@@ -2955,16 +3351,25 @@ tags$small(class="text-muted", " 0=full")),
 min=0, max=15, value=0, step=1, post=" min"), 
 hint_txt("0 = analyze the full quantile. ", 
 "N > 0 = analyze only the first N minutes of each quantile. ",
-"Reduces processing time by ~4x."),
+"Reduces processing time by ~4x. ",
+"Accuracy: in 36 complete therapy sessions, 3 min per quartile gave errors of the size of ",
+"the between-session differences (F0 ±0.4 st, tempo ±0.14 words/s, share of speech ±7 points); ",
+"use ≥10 min per quartile, or the full session, for longitudinal comparisons."),
 hr(),
 checkboxInput("do_pauses","Calculate pauses between turns",TRUE),
 hint_txt("pause_pre_total: time since the previous turn of the same speaker. ",
 "pause_pre_clean: same if the interval does not contain another speaker.")
 ),
 shinydashboard::box(
-title="Whisper Transcription", width=3, status="info",
-checkboxInput("do_transcribe","Activate Whisper",FALSE),
-selectInput("whisper_model","Model",
+title="Transcription", width=3, status="info",
+checkboxInput("do_transcribe","Activate transcription",FALSE),
+selectInput("asr_engine", "Transcription engine",
+  choices = c("Whisper (faster-whisper / mlx-whisper)" = "whisper",
+              "CrisperWhisper 2.0 (verbatim: fillers, repetitions)" = "crisper"),
+  selected = "whisper"),
+hint_txt("CrisperWhisper runs in its own environment (~/.venvs/crisperwhisper); ",
+         "it is installed on first use. The model selector applies to Whisper only."),
+selectInput("whisper_model","Whisper model",
 
 c("large-v3-turbo","large-v3","medium"),"large-v3-turbo"),
 hint_txt("Model HuggingFace: mlx-community/whisper-{model}"),
@@ -2991,9 +3396,28 @@ hint_txt(
 
 )
 ),
-shiny::fluidRow( 
-shinydashboard::box( 
-title="Launch pipeline", width=12, status="primary", 
+shiny::fluidRow(
+shinydashboard::box(
+title="Precomputed results (optional)", width=12, status="info", collapsible=TRUE,
+textInput("precomputed_dir", "Folder with diarization / transcription files",
+          value = "", placeholder = "e.g. ~/Drive/acustera_colab/resultados",
+          width = "100%"),
+hint_txt("For each audio <stem>, AcusTera looks for <stem>_diarizen.json, <stem>_diarizen.rttm, ",
+         "<stem>_pyannote.rttm or <stem>.rttm (any diarizer that writes RTTM) and, if transcription is active, ",
+         "<stem>_crisperwhisper.json or a Whisper JSON. Files found are used instead of running the engine, ",
+         "so heavy models can run on a remote GPU (e.g. the Google Colab notebook in colab/) ",
+         "and the rest of the pipeline runs locally. Sessions without files use the engines selected above."),
+tags$div(class="callout callout-warning", style="margin-top:8px",
+  tags$b("Privacy. "),
+  "By default AcusTera runs entirely on this computer and no audio or transcript leaves it. ",
+  "If you compute these files on a cloud service (e.g. Google Colab), the recordings and their transcriptions ",
+  "are uploaded to that provider's servers and are no longer only local. Check that consent, ethics approval and ",
+  "your institution's data protection rules allow it before doing so.")
+)
+),
+shiny::fluidRow(
+shinydashboard::box(
+title="Launch pipeline", width=12, status="primary",
 actionButton("btn_process", 
 label=tagList(shiny::icon("play")," Launch pipeline"), 
 class="btn btn-primary btn-lg me-3"), 
@@ -3502,6 +3926,8 @@ DTOutput("dt_profile")
 ),
 
 # ── METHODS / LIBRARIES ──────────────────────────────────
+review_tab_ui(),
+
 shinydashboard::tabItem("tab_methods",
 shiny::fluidRow(
 shinydashboard::box(
@@ -3512,7 +3938,10 @@ shiny::HTML(paste0(
 "<ul>",
 "<li><b>pyannote.audio (3.4)</b> — diarization (who speaks when) and overlapping detection. Model: <code>pyannote/speaker-diarization-3.1</code> over MPS/CUDA. Also produces the speaker embedding (by default <i>wespeaker</i>) which is used to identify the therapist by cosine similarity to the therapist's voice sample.</li>",
 
-"<li><b>mlx_whisper</b> (CLI) — automatic transcription (<i>verbatim</i> mode). Returns segments with <code>start</code>, <code>end</code>, <code>text</code>, <code>avg_logprob</code>. Segment→speaker alignment is done by crossing over with pyannote turns.</li>",
+"<li><b>DiariZen</b> (alternative diarization engine) — <code>BUT-FIT/diarizen-wavlm-large-s80-md-v2</code>: WavLM-large local end-to-end neural diarization with clustering; more robust than pyannote 3.1 on long, multi-party recordings with overlap. Runs as a subprocess in its own environment (torch 2.8); GPU (CUDA or MPS) advised.</li>",
+"<li><b>faster-whisper / mlx_whisper</b> — automatic transcription with Whisper (large-v3-turbo by default), with word timestamps and word probabilities. Fluent output: fillers and false starts tend to be removed.</li>",
+"<li><b>CrisperWhisper 2.0</b> (alternative transcription engine) — <code>nyralabs/CrisperWhisper2.0_large</code>, <i>verbatim</i> mode: keeps fillers (<i>eh</i>, <i>mm</i>), repetitions and false starts, with more precise word timestamps. Runs as a subprocess in its own environment.</li>",
+"<li><b>Precomputed results</b> — RTTM files from any diarizer and the JSON files of the Google Colab notebook can be loaded instead of running the engines locally. Words are assigned to diarization turns by their midpoint; segments are split at internal pauses; <code>tempo_wps</code> = words per second of the segment.</li>",
 
 "</ul>",
 
@@ -3580,6 +4009,7 @@ br(), hr(),
 shiny::tags$h5("Report v2 (with hints for AI)"), 
 shiny::uiOutput("ui_dl_v2"), 
 br(), 
+shiny::div(class = "callout callout-warning", shiny::tags$b("Privacy. "), "This option sends data to an external provider (Anthropic or OpenAI): ", "excerpts of the transcript and acoustic summaries leave this computer. ", "Use it only if consent, ethics approval and data protection rules allow it. ", "The rest of AcusTera runs locally."),
 shiny::selectInput("ai_report_provider","AI Provider", 
 c("Anthropic" = "anthropic", "OpenAI" = "openai"), "anthropic"), 
 shiny::actionButton("btn_ai_interpret", 
@@ -3668,6 +4098,7 @@ examples_v2_js
 # ══════════════════════════════════════════════════════════════
 
 server <- function(input, output, session) {
+  review_server(input, output, session)
 
   rv <- reactiveValues(
     sessions=NULL, refs=NULL, sess_meta=NULL, spk_meta=NULL,
@@ -3905,18 +4336,40 @@ log_add("do_pauses = ", isTRUE(input$do_pauses))
       stems_tg    <- tools::file_path_sans_ext(input$files_textgrids$name)
       any(!tolower(stems_audio) %in% tolower(stems_tg))
     }
-    if (.needs_diarization) {
+    diar_engine <- input$diar_engine %||% "pyannote"
+    asr_engine  <- input$asr_engine  %||% "whisper"
+    pre_dir     <- trimws(input$precomputed_dir %||% "")
+    stems_all   <- tools::file_path_sans_ext(rv$sessions$name)
+    .has_pre <- function(kind) vapply(stems_all,
+      \(st) !is.null(find_precomputed(pre_dir, st, kind)), logical(1))
+    if (nzchar(pre_dir))
+      log_add(sprintf("Precomputed folder: %d/%d sessions with diarization, %d/%d with transcription.",
+                      sum(.has_pre("diar")), length(stems_all),
+                      sum(.has_pre("asr")),  length(stems_all)))
+    .needs_diarization <- .needs_diarization && !all(.has_pre("diar"))
+    log_add("Engines: diarization = ", diar_engine,
+            if (isTRUE(input$do_transcribe)) paste0(", transcription = ", asr_engine) else "")
+    if (.needs_diarization && diar_engine == "pyannote") {
       ensure_pyannote(log_add)
       rv$device <- init_pyannote_pipelines(input$hf_token,
                       input$embedding_model %||% 'microsoft/wavlm-base-plus-sv',
                       log_add)
+    } else if (.needs_diarization && diar_engine == "diarizen") {
+      tryCatch(ensure_engine("diarizen", log_add),
+               error = \(e) log_add("ERROR DiariZen: ", conditionMessage(e)))
+      rv$device <- "subprocess"
     } else {
-      log_add("All sessions have a TextGrid — skipping pyannote initialisation.")
+      log_add("No session needs automatic diarization (TextGrid or precomputed files).")
       rv$device <- "cpu"
     }
-    if (isTRUE(input$do_transcribe)) {
-      ensure_whisper(log_add)
-      init_whisper(input$whisper_model %||% "large-v3-turbo", log_add)
+    if (isTRUE(input$do_transcribe) && !all(.has_pre("asr"))) {
+      if (asr_engine == "crisper") {
+        tryCatch(ensure_engine("crisper", log_add),
+                 error = \(e) log_add("ERROR CrisperWhisper: ", conditionMessage(e)))
+      } else {
+        ensure_whisper(log_add)
+        init_whisper(input$whisper_model %||% "large-v3-turbo", log_add)
+      }
     }
 
     # Embeddings de referencia
@@ -3973,6 +4426,9 @@ log_add("do_pauses = ", isTRUE(input$do_pauses))
           clustering_threshold   = as.numeric(input$clustering_threshold %||% 0.7),
           segmentation_threshold = as.numeric(input$segmentation_threshold %||% 0.5),
           textgrid_path          = tg_path,
+          diar_engine            = diar_engine,
+          asr_engine             = asr_engine,
+          precomputed_dir        = if (nzchar(pre_dir)) pre_dir else NULL,
           log                    = log_add),
         error=function(e){
           log_add("ERROR: ",s$name," — ",conditionMessage(e)); NULL})

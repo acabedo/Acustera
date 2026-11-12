@@ -146,6 +146,7 @@ ui_tab_ai_review <- function() {
     shiny::fluidRow(
       shinydashboard::box(
         title = "AI review of speaker attribution", width = 12, status = "primary",
+        shiny::div(class = "callout callout-warning", shiny::tags$b("Privacy. "), "This option sends data to an external provider (Anthropic or OpenAI): ", "excerpts of the transcript and acoustic summaries leave this computer. ", "Use it only if consent, ethics approval and data protection rules allow it. ", "The rest of AcusTera runs locally."),
         shiny::div(class = "callout callout-info",
           shiny::tags$b("Two modes:"), shiny::tags$br(),
           shiny::tags$b("1) Fast heuristic:"),
